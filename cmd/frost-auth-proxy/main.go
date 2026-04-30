@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -20,6 +22,7 @@ import (
 type config struct {
 	listenAddr         string
 	frostServerBase    *url.URL
+	proxyBase          *url.URL
 	authRequired       bool
 	jwtSecretKey       []byte
 	jwtAccessCookie    string
@@ -48,7 +51,7 @@ func main() {
 		ResponseHeaderTimeout: cfg.responseHdrTimeout,
 	}
 
-	proxy := newReverseProxy(cfg.frostServerBase, transport, cfg.jwtAccessCookie)
+	proxy := newReverseProxy(cfg.frostServerBase, cfg.proxyBase, transport, cfg.jwtAccessCookie)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -84,6 +87,9 @@ func main() {
 
 	log.Printf("listening on %s", cfg.listenAddr)
 	log.Printf("proxying to %s", cfg.frostServerBase.String())
+	if cfg.proxyBase != nil {
+		log.Printf("rewriting JSON links to %s", cfg.proxyBase.String())
+	}
 	if cfg.authRequired {
 		log.Printf("auth required: true")
 	} else {
@@ -119,6 +125,14 @@ func loadConfig() (*config, error) {
 	}
 	frostBaseURL.Path = strings.TrimRight(frostBaseURL.Path, "/")
 
+	proxyBaseURL, err := parseOptionalURL(strings.TrimSpace(os.Getenv("PROXY_BASE_URL")))
+	if err != nil {
+		return nil, fmt.Errorf("invalid PROXY_BASE_URL: %w", err)
+	}
+	if proxyBaseURL != nil {
+		proxyBaseURL.Path = strings.TrimRight(proxyBaseURL.Path, "/")
+	}
+
 	authRequired := parseBoolEnv("AUTH_REQUIRED", true)
 	jwtAccessCookie := strings.TrimSpace(os.Getenv("JWT_ACCESS_COOKIE_NAME"))
 	if jwtAccessCookie == "" {
@@ -136,6 +150,7 @@ func loadConfig() (*config, error) {
 	return &config{
 		listenAddr:         ":" + port,
 		frostServerBase:    frostBaseURL,
+		proxyBase:          proxyBaseURL,
 		authRequired:       authRequired,
 		jwtSecretKey:       []byte(secret),
 		jwtAccessCookie:    jwtAccessCookie,
@@ -175,7 +190,7 @@ func parseDurationEnv(key string, def time.Duration) time.Duration {
 	return d
 }
 
-func newReverseProxy(targetBase *url.URL, transport http.RoundTripper, jwtCookieName string) *httputil.ReverseProxy {
+func newReverseProxy(targetBase *url.URL, proxyBase *url.URL, transport http.RoundTripper, jwtCookieName string) *httputil.ReverseProxy {
 	proxy := httputil.NewSingleHostReverseProxy(targetBase)
 	originalDirector := proxy.Director
 	proxy.Director = func(r *http.Request) {
@@ -207,10 +222,52 @@ func newReverseProxy(targetBase *url.URL, transport http.RoundTripper, jwtCookie
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 	}
 	proxy.ModifyResponse = func(resp *http.Response) error {
+		if proxyBase == nil {
+			return nil
+		}
+		contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+		if !strings.Contains(contentType, "application/json") {
+			return nil
+		}
+		if resp.Body == nil {
+			return nil
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return err
+		}
+		_ = resp.Body.Close()
+
+		rewritten := bytes.ReplaceAll(body, []byte(targetBase.String()), []byte(proxyBase.String()))
+		if !bytes.Equal(rewritten, body) {
+			resp.Body = io.NopCloser(bytes.NewReader(rewritten))
+			resp.ContentLength = int64(len(rewritten))
+			resp.Header.Set("Content-Length", strconv.Itoa(len(rewritten)))
+		} else {
+			resp.Body = io.NopCloser(bytes.NewReader(body))
+		}
 		return nil
 	}
 
 	return proxy
+}
+
+func parseOptionalURL(raw string) (*url.URL, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("must be http(s)")
+	}
+	if u.Host == "" {
+		return nil, fmt.Errorf("missing host")
+	}
+	return u, nil
 }
 
 func extractToken(r *http.Request, cookieName string) string {

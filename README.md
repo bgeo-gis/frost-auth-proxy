@@ -35,3 +35,5 @@ Environment
   - JWT_ACCESS_COOKIE_NAME: cookie name to read JWT from (default: access_token_cookie)
   - CONNECT_TIMEOUT: e.g. 2s (default: 2s)
   - RESPONSE_HEADER_TIMEOUT: e.g. 15s (default: 15s)
+  - PROXY_BASE_URL: Public base URL for this proxy. When set, JSON responses will have
+    upstream URLs rewritten to this base (http(s)://host[:port][/basepath]).
